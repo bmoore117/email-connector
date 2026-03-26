@@ -1,0 +1,8 @@
+.env
+.processed_ids
+.venv/
+__pycache__/
+connector.log
+health.json
+past_events.json
+upcoming_events.json
