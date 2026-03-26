@@ -10,13 +10,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 from imap_tools import MailBox
 
-from parse_events import parse_email
+from parse_events import parse_email, fetch_luma_calendar
 
 load_dotenv()
 
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 GMAIL_LABEL = os.environ.get("GMAIL_LABEL", "miami-social-event-source")
+LUMA_CALENDARS = [s.strip() for s in os.environ.get("LUMA_CALENDARS", "").split(",") if s.strip()]
 UPCOMING_EVENTS_PATH = Path(os.environ.get("UPCOMING_EVENTS_PATH", "upcoming_events.json"))
 PAST_EVENTS_PATH = Path(os.environ.get("PAST_EVENTS_PATH", "past_events.json"))
 HEALTH_OUTPUT_PATH = Path(os.environ.get("HEALTH_OUTPUT_PATH", "health.json"))
@@ -178,6 +179,15 @@ def main() -> None:
 
                 processed_ids.add(msg_id)
                 emails_processed += 1
+
+        # Fetch directly from key Luma calendars to broaden scope beyond Gmail emails only.
+        # Uses existing parsing logic from parse_events.py.
+        for slug in LUMA_CALENDARS:
+            log.info("Fetching from Luma calendar: %s", slug)
+            events = fetch_luma_calendar(slug)
+            if events:
+                new_events.extend(events)
+                log.info("  -> extracted %d event(s) via %s", len(events), events[0].get("parse_method", "luma"))
 
         save_processed_ids(processed_ids)
 

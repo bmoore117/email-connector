@@ -1,16 +1,18 @@
-# email-connector
+# email-connector (now broadened to Luma calendars)
 
-Fetches event-related emails from a Gmail label via IMAP, extracts event details
-(from `.ics` attachments or plain-text body), and writes structured output files
-for the OpenClaw bot's calendar skill to read.
+Fetches event-related emails from a Gmail label via IMAP *and* directly fetches
+upcoming events from key Luma calendars (e.g. FTLYR, hello_miami, labmiami,
+delphica). Uses existing requests/BeautifulSoup/Luma parsing logic from
+parse_events.py. Writes structured output files for the OpenClaw bot's calendar skill.
 
 ## How it works
 
 1. Emails from your private groups arrive in Gmail
 2. A Gmail filter auto-labels them with your chosen label (e.g. `miami-social-event-source`)
-3. This script connects via IMAP, reads new emails from that label, and extracts events
-4. Events are written to `events.json`; run status is written to `health.json`
-5. A cron job runs the script every 30 minutes on the Lightsail instance
+3. This script connects via IMAP to read new emails *and* directly scrapes key Luma calendars
+4. Events from both sources are merged into `upcoming_events.json` (and `past_events.json`)
+5. Run status written to `health.json`
+6. A cron job runs the script every 30 minutes on the Lightsail instance
 
 ## Prerequisites
 
@@ -53,6 +55,7 @@ All configuration lives in `.env`. Copy `.env.example` and fill in:
 | `GMAIL_USER` | Your Gmail address |
 | `GMAIL_APP_PASSWORD` | App password from Google account security settings |
 | `GMAIL_LABEL` | Gmail label to read from (default: `miami-social-event-source`) |
+| `LUMA_CALENDARS` | Comma-separated Luma calendar slugs (e.g. FTLYR,hello_miami,labmiami,delphica) |
 | `UPCOMING_EVENTS_PATH` | Where to write `upcoming_events.json` (absolute path) |
 | `PAST_EVENTS_PATH` | Where to write `past_events.json` (absolute path) |
 | `HEALTH_OUTPUT_PATH` | Where to write `health.json` (absolute path) |

@@ -129,21 +129,28 @@ def _from_jsonld(data: Any, source_url: str) -> list[dict[str, Any]]:
 def _from_next_data(data: dict, source_url: str) -> list[dict[str, Any]]:
     """Navigate Luma's Next.js pageProps to find the event object."""
     props = data.get("props", {}).get("pageProps", {})
+    initial_data = props.get("initialData") or {}
 
-    # Luma has used several key names across versions
+    # Calendar / group pages (e.g. lu.ma/hello_miami) store a list of featured
+    # events rather than a single event object.
+    if initial_data.get("kind") == "calendar":
+        return _from_luma_calendar_data(initial_data.get("data") or {}, source_url)
+
+    # Individual event pages — Luma has used several key names across versions.
     event = (
         props.get("event")
         or props.get("initialEvent")
         or props.get("eventData")
-        or (props.get("initialData") or {}).get("event")
+        or (initial_data.get("data") or {}).get("event")
+        or initial_data.get("event")
     )
     if not event or not isinstance(event, dict):
         return []
 
     start_at = event.get("start_at")
     end_at = event.get("end_at")
-    geo = event.get("geo_address_json") or {}
-    location = geo.get("full_address") or event.get("location") or None
+    geo = event.get("geo_address_json") or event.get("geo_address_info") or {}
+    location = geo.get("full_address") or geo.get("short_address") or event.get("location") or None
 
     return [{
         "title": event.get("name", ""),
@@ -156,6 +163,45 @@ def _from_next_data(data: dict, source_url: str) -> list[dict[str, Any]]:
         "luma_url": source_url,
         "parse_method": "luma_nextdata",
     }]
+
+
+def _from_luma_calendar_data(data: dict, source_url: str) -> list[dict[str, Any]]:
+    """Extract featured upcoming events from a Luma calendar page's Next.js data.
+
+    Calendar pages embed up to ~3 featured events in ``featured_items``.  Each
+    entry's ``event.url`` is a short slug that maps to the full event page at
+    ``https://lu.ma/<slug>``.  Descriptions are not included in the calendar
+    listing, so callers should follow those URLs to retrieve full details.
+    """
+    featured_items = data.get("featured_items") or []
+    events = []
+    for item in featured_items:
+        ev = item.get("event") or {}
+        if not ev or not ev.get("name"):
+            continue
+
+        start_at = ev.get("start_at") or item.get("start_at")
+        end_at = ev.get("end_at")
+
+        # Calendar listings use geo_address_info; event pages use geo_address_json.
+        geo = ev.get("geo_address_info") or ev.get("geo_address_json") or {}
+        location = geo.get("full_address") or geo.get("short_address") or None
+
+        slug = ev.get("url") or ""
+        event_url = f"https://lu.ma/{slug}" if slug else source_url
+
+        events.append({
+            "title": ev.get("name", ""),
+            "date": _iso_date(start_at),
+            "time": _iso_time(start_at),
+            "end_date": _iso_date(end_at),
+            "end_time": _iso_time(end_at),
+            "location": location,
+            "description": ev.get("description") or None,
+            "luma_url": event_url,
+            "parse_method": "luma_calendar_nextdata",
+        })
+    return events
 
 
 def _scrape_luma_html(soup: BeautifulSoup, source_url: str) -> list[dict[str, Any]]:
@@ -315,3 +361,46 @@ def _fmt_time(dt: date | datetime | None) -> str | None:
     if isinstance(dt, datetime):
         return dt.strftime("%H:%M")
     return None
+
+
+def fetch_luma_calendar(slug_or_url: str) -> list[dict[str, Any]]:
+    """Fetch upcoming events from a Luma calendar / group page.
+
+    Strategy:
+    1. Fetch the calendar page and extract the featured events from its
+       ``__NEXT_DATA__`` JSON (up to ~3 upcoming events).
+    2. For each featured event, follow its individual event URL to retrieve
+       full details — in particular the description, which is absent from the
+       calendar listing.
+    3. Fall back to the stub data from step 1 if an individual fetch fails.
+    """
+    if not slug_or_url.startswith(("http://", "https://")):
+        url = f"https://lu.ma/{slug_or_url}"
+    else:
+        url = slug_or_url
+
+    try:
+        resp = requests.get(url, timeout=15, headers=_REQUEST_HEADERS)
+        resp.raise_for_status()
+    except Exception as exc:
+        log.warning("Failed to fetch Luma calendar %s: %s", url, exc)
+        return []
+
+    stub_events = _parse_luma_page(resp.text, url)
+    if not stub_events:
+        return []
+
+    enriched: list[dict[str, Any]] = []
+    for stub in stub_events:
+        event_url = stub.get("luma_url", "")
+        # Only follow through to the individual page when we have a distinct
+        # event URL (not just the calendar URL itself).
+        if event_url and event_url != url and stub.get("parse_method") == "luma_calendar_nextdata":
+            log.info("    -> fetching event page: %s", event_url)
+            detail = _fetch_luma_event(event_url)
+            if detail:
+                enriched.extend(detail)
+                continue
+        enriched.append(stub)
+
+    return enriched
