@@ -91,6 +91,21 @@ def _is_past(event: dict) -> bool:
     return event_date < date.today()
 
 
+def _event_key(event: dict) -> str:
+    """Canonical deduplication key for an event.
+
+    Uses the Luma event URL (query string stripped) when available, since that
+    is stable across runs and across email vs. calendar-crawl sources.  Falls
+    back to ``title|date`` for events that have no URL.
+    """
+    url = (event.get("luma_url") or "").split("?")[0].rstrip("/").lower()
+    if url:
+        return url
+    title = (event.get("title") or "").strip().lower()
+    date_val = (event.get("date") or "").strip()
+    return f"{title}|{date_val}"
+
+
 def _rotate_and_classify(
     upcoming: list[dict],
     past: list[dict],
@@ -98,14 +113,27 @@ def _rotate_and_classify(
 ) -> tuple[list[dict], list[dict]]:
     """
     1. Move any existing upcoming events whose date has now passed into past.
-    2. Classify each new event into upcoming or past based on its date.
+    2. Classify each new event into upcoming or past, skipping duplicates.
     Returns (new_upcoming, new_past).
     """
     rotated_to_past = [e for e in upcoming if _is_past(e)]
     still_upcoming = [e for e in upcoming if not _is_past(e)]
 
-    new_upcoming = [e for e in new_events if not _is_past(e)]
-    new_past = [e for e in new_events if _is_past(e)]
+    seen_upcoming = {_event_key(e) for e in still_upcoming}
+    seen_past = {_event_key(e) for e in past + rotated_to_past}
+
+    new_upcoming: list[dict] = []
+    new_past: list[dict] = []
+    for e in new_events:
+        key = _event_key(e)
+        if _is_past(e):
+            if key not in seen_past:
+                new_past.append(e)
+                seen_past.add(key)
+        else:
+            if key not in seen_upcoming:
+                new_upcoming.append(e)
+                seen_upcoming.add(key)
 
     return (
         still_upcoming + new_upcoming,

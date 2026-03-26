@@ -390,8 +390,20 @@ def fetch_luma_calendar(slug_or_url: str) -> list[dict[str, Any]]:
     if not stub_events:
         return []
 
+    # Discard events that have already passed — calendar pages sometimes surface
+    # very recently-ended events in their "featured" list.  ISO date strings are
+    # lexicographically sortable, so plain string comparison is safe here.
+    today = _iso_date(datetime.now(timezone.utc).isoformat())  # "YYYY-MM-DD"
+    upcoming_stubs = [
+        s for s in stub_events
+        if not s.get("date") or s["date"] >= today  # keep if date unknown or future
+    ]
+    if not upcoming_stubs:
+        log.info("    -> no upcoming featured events on calendar page")
+        return []
+
     enriched: list[dict[str, Any]] = []
-    for stub in stub_events:
+    for stub in upcoming_stubs:
         event_url = stub.get("luma_url", "")
         # Only follow through to the individual page when we have a distinct
         # event URL (not just the calendar URL itself).
