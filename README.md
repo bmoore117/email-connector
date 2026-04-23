@@ -2,17 +2,19 @@
 
 Fetches event-related emails from a Gmail label via IMAP *and* directly fetches
 upcoming events from key Luma calendars (e.g. FTLYR, hello_miami, labmiami,
-delphica). Uses existing requests/BeautifulSoup/Luma parsing logic from
-parse_events.py. Writes structured output files for the OpenClaw bot's calendar skill.
+delphica). Dedups them into `upcoming_events.json`, rotates past events out,
+and — when there's something worth saying — hands the newly discovered events
+to an OpenClaw TaskFlow that DMs you about them on Slack.
 
 ## How it works
 
 1. Emails from your private groups arrive in Gmail
 2. A Gmail filter auto-labels them with your chosen label (e.g. `miami-social-event-source`)
 3. This script connects via IMAP to read new emails *and* directly scrapes key Luma calendars
-4. Events from both sources are merged into `upcoming_events.json` (and `past_events.json`)
-5. Run status written to `health.json`
-6. A cron job runs the script every 30 minutes on the Lightsail instance
+4. Events from both sources are dedup'd, filtered to the next 7 days, and merged into `upcoming_events.json` (with rotated-out events moving to `past_events.json`)
+5. Run status is written to `health.json`
+6. If this run discovered any *newly* upcoming events — or the run errored — a JSON trigger artifact is written and the connector POSTs to the Gateway's Webhooks plugin, creating a managed TaskFlow. The agent reads the artifact, composes a summary, and DMs you on Slack. Runs with nothing new and no errors are silent.
+7. A cron job runs the script every 30 minutes on the Lightsail instance
 
 ## Prerequisites
 
@@ -61,6 +63,10 @@ All configuration lives in `.env`. Copy `.env.example` and fill in:
 | `HEALTH_OUTPUT_PATH` | Where to write `health.json` (absolute path) |
 | `LOG_PATH` | Where to write `connector.log` (absolute path) |
 | `PROCESSED_IDS_PATH` | Tracks seen Message-IDs to prevent duplicates |
+| `TASKFLOW_USER_TARGET` | Slack user ID the agent should DM with its final message (i.e. you) |
+| `TASKFLOW_TRIGGER_PATH` | Where to write the JSON trigger artifact the agent reads |
+| `TASKFLOW_WEBHOOK_URL` | Gateway Webhooks plugin URL that creates the managed TaskFlow (usually `http://localhost:18790/plugins/webhooks/<route>`) |
+| `TASKFLOW_WEBHOOK_SECRET` | Shared secret matching the webhook route's configured secret on the Gateway |
 
 ## Running manually
 
@@ -108,6 +114,7 @@ Both files contain the same event object shape:
     "parse_method": "luma_nextdata",
     "source_email": "events@privategroup.org",
     "source_message_id": "<abc123@mail.gmail.com>",
+    "source": "luma_calendar:FTLYR",
     "fetched_at": "2026-03-15T14:00:00Z"
   }
 ]
@@ -119,9 +126,14 @@ Both files contain the same event object shape:
 |---|---|
 | `luma_jsonld` | JSON-LD structured data on the Luma event page |
 | `luma_nextdata` | Next.js server-side props on the Luma event page |
+| `luma_calendar_nextdata` | Featured-events block on a Luma calendar/group page |
 | `luma_html_scrape` | Best-effort HTML scrape of the Luma page |
 | `ics` | `.ics` calendar attachment in the email |
 | `body_text` | Heuristic date/time extraction from plain text body |
+
+`source` is set on events discovered by directly crawling a Luma calendar
+(`luma_calendar:<slug-or-url>`). Events parsed out of emails leave it unset
+but carry `source_email` / `source_message_id` instead.
 
 ### `health.json`
 
@@ -135,7 +147,8 @@ Current-state snapshot written after every run. The bot checks this to detect fa
   "last_error": null,
   "last_error_time": null,
   "emails_processed_last_run": 2,
-  "total_events": 8
+  "upcoming_events": 6,
+  "past_events": 12
 }
 ```
 
@@ -147,17 +160,68 @@ If `consecutive_failures > 0`, something is wrong. Common causes:
 
 Append-only log of every run. Useful for diagnosing issues or reviewing history.
 
-## Bot integration
+### Trigger artifact (`TASKFLOW_TRIGGER_PATH`)
 
-Point the OpenClaw calendar skill at `UPCOMING_EVENTS_PATH` to read events.
-`PAST_EVENTS_PATH` is available if the bot needs historical context.
+Written (and overwritten) at the end of each run that has something to surface.
+Consumed by the agent via `--path` on the trigger Slack message.
 
-For monitoring, the bot should read `health.json` on a schedule and alert if:
-- `consecutive_failures > 0` — surface `last_error` to describe what went wrong
-- `last_run` is more than ~1 hour old — cron may have stopped running
+```json
+{
+  "triggered_at": "2026-04-23T18:05:00",
+  "health": { "...": "same shape as health.json" },
+  "newEvents": [ { "...": "events discovered for the first time this run" } ],
+  "hasErrors": false,
+  "targetUserId": "U0AL1GKMR6J",
+  "requirements": {
+    "step1": "If hasErrors, DM the user a brief description of health.last_error.",
+    "step2": "Otherwise, read through newEvents, cross-ref committed-events.md and pm-rhythm, flag 1-2 best, suggest balance, and offer to commit."
+  }
+}
+```
 
-The `last_error` field contains the raw exception message, which the bot can translate
-into a plain-English explanation and suggested fix for the user.
+## Agent integration
+
+The connector pushes to the agent rather than the agent polling. On each run:
+
+1. `health.json` and `upcoming_events.json` / `past_events.json` are written as usual.
+2. If there are newly discovered events *or* the run errored, the connector
+   writes the trigger artifact to `TASKFLOW_TRIGGER_PATH` and POSTs to
+   `TASKFLOW_WEBHOOK_URL` with `Authorization: Bearer <TASKFLOW_WEBHOOK_SECRET>`.
+   The body is a `create_flow` action whose `goal` points the agent at the
+   artifact on disk.
+3. The Gateway's Webhooks plugin creates a managed TaskFlow bound to the
+   configured agent session. The agent reads the artifact, works through
+   `newEvents` itself (no keyword pre-filter), and DMs its final message to
+   `TASKFLOW_USER_TARGET`.
+4. If `hasErrors` is true, the agent synthesizes a human-readable summary from
+   `health.last_error` instead of running the radar.
+
+Runs that find nothing new and have a clean health status are silent — no
+TaskFlow is created, no DM is produced.
+
+### Gateway setup (one-time)
+
+The Webhooks plugin (OpenClaw 2026.4.7+) must be configured on the Gateway.
+Add a route under `plugins.entries.webhooks.config.routes`:
+
+```json5
+{
+  miami_social_radar: {
+    path: "/plugins/webhooks/miami-social-radar",
+    sessionKey: "agent:main:main",
+    secret: {
+      source: "env",
+      provider: "default",
+      id: "MIAMI_SOCIAL_RADAR_WEBHOOK_SECRET",
+    },
+    description: "Trigger miami-social event radar flow from email-connector",
+  },
+}
+```
+
+Set `MIAMI_SOCIAL_RADAR_WEBHOOK_SECRET` in the Gateway's environment to a
+strong random string, restart the Gateway, then put the same string into this
+project's `.env` as `TASKFLOW_WEBHOOK_SECRET`.
 
 ## Updating
 

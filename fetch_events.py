@@ -3,9 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
 import sys
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -25,6 +24,13 @@ PAST_EVENTS_PATH = Path(os.environ.get("PAST_EVENTS_PATH", "past_events.json"))
 HEALTH_OUTPUT_PATH = Path(os.environ.get("HEALTH_OUTPUT_PATH", "health.json"))
 LOG_PATH = Path(os.environ.get("LOG_PATH", "connector.log"))
 PROCESSED_IDS_PATH = Path(os.environ.get("PROCESSED_IDS_PATH", ".processed_ids"))
+
+# Taskflow / agent routing — everything trigger_radar needs comes from here
+# so taskflow.py never touches disk for config.
+TASKFLOW_USER_TARGET = os.environ.get("TASKFLOW_USER_TARGET", "")
+TASKFLOW_TRIGGER_PATH = Path(os.environ.get("TASKFLOW_TRIGGER_PATH", "miami-social-radar-trigger.json"))
+TASKFLOW_WEBHOOK_URL = os.environ.get("TASKFLOW_WEBHOOK_URL", "")
+TASKFLOW_WEBHOOK_SECRET = os.environ.get("TASKFLOW_WEBHOOK_SECRET", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,11 +85,14 @@ def _rotate_and_classify(
     upcoming: list[dict],
     past: list[dict],
     new_events: list[dict],
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[dict]]:
     """
     1. Move any existing upcoming events whose date has now passed into past.
     2. Classify each new event into upcoming or past, skipping duplicates.
-    Returns (new_upcoming, new_past).
+
+    Returns ``(new_upcoming, new_past, newly_added_upcoming)`` — the third
+    element is just the events added to the upcoming list this run, which is
+    what the TaskFlow cares about.
     """
     rotated_to_past = [e for e in upcoming if is_past(e)]
     still_upcoming = [e for e in upcoming if not is_past(e)]
@@ -94,26 +103,28 @@ def _rotate_and_classify(
     seen_upcoming = {_event_key(e) for e in still_upcoming}
     seen_past = {_event_key(e) for e in past + rotated_to_past}
 
-    new_upcoming: list[dict] = []
-    new_past: list[dict] = []
+    newly_added_upcoming: list[dict] = []
+    newly_added_past: list[dict] = []
     for e in new_events:
         key = _event_key(e)
         if is_past(e):
             if key not in seen_past:
-                new_past.append(e)
+                newly_added_past.append(e)
                 seen_past.add(key)
         else:
             if key not in seen_upcoming and is_in_next_n_days(e):
-                new_upcoming.append(e)
+                newly_added_upcoming.append(e)
                 seen_upcoming.add(key)
 
     return (
-        still_upcoming + new_upcoming,
-        past + rotated_to_past + new_past,
+        still_upcoming + newly_added_upcoming,
+        past + rotated_to_past + newly_added_past,
+        newly_added_upcoming,
     )
 
 
-def write_health(*, last_error: str | None, emails_processed: int, upcoming_count: int, past_count: int) -> None:
+def build_health(*, last_error: str | None, emails_processed: int, upcoming_count: int, past_count: int) -> dict:
+    """Build the health dict for this run, rolling in prior state from disk."""
     now = datetime.now(timezone.utc).isoformat()
 
     existing: dict = {}
@@ -132,7 +143,7 @@ def write_health(*, last_error: str | None, emails_processed: int, upcoming_coun
         last_success = now
         last_error_time = existing.get("last_error_time")
 
-    health = {
+    return {
         "last_run": now,
         "last_success": last_success,
         "consecutive_failures": consecutive_failures,
@@ -142,7 +153,25 @@ def write_health(*, last_error: str | None, emails_processed: int, upcoming_coun
         "upcoming_events": upcoming_count,
         "past_events": past_count,
     }
+
+
+def write_health(health: dict) -> None:
     HEALTH_OUTPUT_PATH.write_text(json.dumps(health, indent=2))
+
+
+def _fire_trigger(*, new_events: list[dict], health: dict) -> None:
+    """Wrap trigger_radar with the env-driven routing bits and error swallowing."""
+    try:
+        trigger_radar(
+            new_events=new_events,
+            health=health,
+            user_target=TASKFLOW_USER_TARGET,
+            trigger_path=TASKFLOW_TRIGGER_PATH,
+            webhook_url=TASKFLOW_WEBHOOK_URL,
+            webhook_secret=TASKFLOW_WEBHOOK_SECRET,
+        )
+    except Exception as exc:
+        log.warning("Radar trigger failed (non-fatal): %s", exc)
 
 
 def main() -> None:
@@ -191,41 +220,49 @@ def main() -> None:
 
         save_processed_ids(processed_ids)
 
-        upcoming_events, past_events = _rotate_and_classify(upcoming_events, past_events, new_events)
+        upcoming_events, past_events, newly_added = _rotate_and_classify(
+            upcoming_events, past_events, new_events
+        )
         _write_json_list(UPCOMING_EVENTS_PATH, upcoming_events)
         _write_json_list(PAST_EVENTS_PATH, past_events)
 
         log.info(
-            "Run complete: %d email(s) processed, %d new event(s), %d upcoming, %d past",
+            "Run complete: %d email(s) processed, %d event(s) parsed, %d newly upcoming, %d upcoming total, %d past total",
             emails_processed,
             len(new_events),
+            len(newly_added),
             len(upcoming_events),
             len(past_events),
         )
-        write_health(
+        health = build_health(
             last_error=None,
             emails_processed=emails_processed,
             upcoming_count=len(upcoming_events),
             past_count=len(past_events),
         )
+        write_health(health)
 
-        # Trigger the event-driven miami-social radar TaskFlow on success
-        # upcoming_events.json now only contains prospective events (next ~7 days)
-        # so we can pass the full list directly
-        try:
-            trigger_radar(upcoming_events=upcoming_events)
-            log.info("Successfully triggered radar TaskFlow")
-        except Exception as radar_exc:
-            log.warning("Radar trigger failed (non-fatal): %s", radar_exc)
+        # Only wake the agent when there is something new to surface or an
+        # unresolved error to explain. Otherwise successful-but-empty runs
+        # would DM the user every 30 minutes.
+        has_errors = bool(health.get("consecutive_failures", 0)) or bool(health.get("last_error"))
+        if newly_added or has_errors:
+            log.info("Triggering radar TaskFlow (%d new event(s), errors=%s)", len(newly_added), has_errors)
+            _fire_trigger(new_events=newly_added, health=health)
+        else:
+            log.info("No new events and no errors — skipping TaskFlow trigger")
 
     except Exception as exc:
         log.error("Run failed: %s", exc, exc_info=True)
-        write_health(
+        health = build_health(
             last_error=str(exc),
             emails_processed=emails_processed,
             upcoming_count=len(upcoming_events),
             past_count=len(past_events),
         )
+        write_health(health)
+        # Still fire a trigger on error so the agent can DM about the failure.
+        _fire_trigger(new_events=[], health=health)
         sys.exit(1)
 
 

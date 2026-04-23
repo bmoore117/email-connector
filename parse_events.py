@@ -315,14 +315,31 @@ def _parse_body(text: str) -> list[dict[str, Any]]:
 
 # --- Shared enrichment ---
 
-def _enrich(events: list[dict], msg: Any) -> list[dict]:
+def _enrich(events: list[dict], msg: Any = None, *, source: str | None = None) -> list[dict]:
+    """Stamp provenance fields onto a list of events.
+
+    When ``msg`` is provided (email path) we fill in ``source_email``,
+    ``source_message_id``, and a title fallback from the email subject.
+    When ``source`` is provided (e.g. ``luma_calendar:FTLYR``) we stamp it
+    onto every event so the agent can explain where each event came from.
+    ``fetched_at`` is always stamped.
+    """
     fetched_at = datetime.now(timezone.utc).isoformat()
-    msg_id = (msg.headers.get("message-id") or [None])[0]
+    msg_id = None
+    msg_from = None
+    msg_subject = None
+    if msg is not None:
+        msg_id = (msg.headers.get("message-id") or [None])[0]
+        msg_from = msg.from_
+        msg_subject = msg.subject
+
     for event in events:
-        if not event.get("title"):
-            event["title"] = msg.subject
-        event["source_email"] = msg.from_
+        if msg is not None and not event.get("title"):
+            event["title"] = msg_subject
+        event["source_email"] = msg_from
         event["source_message_id"] = msg_id
+        if source is not None:
+            event["source"] = source
         event["fetched_at"] = fetched_at
     return events
 
@@ -415,7 +432,7 @@ def fetch_luma_calendar(slug_or_url: str) -> list[dict[str, Any]]:
                 continue
         enriched.append(stub)
 
-    return enriched
+    return _enrich(enriched, source=f"luma_calendar:{slug_or_url}")
 
 
 def _parse_event_date(date_str: str | None) -> date | None:
