@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -10,7 +11,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from imap_tools import MailBox
 
-from parse_events import parse_email, fetch_luma_calendar
+from parse_events import parse_email, fetch_luma_calendar, is_past, is_in_next_n_days, filter_prospective
+from taskflow import trigger_radar
 
 load_dotenv()
 
@@ -58,39 +60,6 @@ def _write_json_list(path: Path, events: list[dict]) -> None:
     path.write_text(json.dumps(events, indent=2, default=str))
 
 
-def _parse_event_date(date_str: str | None) -> date | None:
-    """Parse the event's date field to a date object. Returns None if unparseable."""
-    if not date_str:
-        return None
-    # ISO format (primary source from Luma/ICS)
-    try:
-        return date.fromisoformat(date_str)
-    except ValueError:
-        pass
-    # Natural-language fallbacks (body_text / html_scrape parse methods)
-    for fmt in ("%B %d, %Y", "%A, %B %d", "%A, %B %d, %Y"):
-        try:
-            parsed = datetime.strptime(date_str, fmt)
-            # For formats without a year, assume the next occurrence
-            if "%Y" not in fmt:
-                today = date.today()
-                parsed = parsed.replace(year=today.year)
-                if parsed.date() < today:
-                    parsed = parsed.replace(year=today.year + 1)
-            return parsed.date()
-        except ValueError:
-            continue
-    return None
-
-
-def _is_past(event: dict) -> bool:
-    """Return True if the event date is strictly before today (i.e. it has ended)."""
-    event_date = _parse_event_date(event.get("date"))
-    if event_date is None:
-        return False  # Can't determine — leave in upcoming
-    return event_date < date.today()
-
-
 def _event_key(event: dict) -> str:
     """Canonical deduplication key for an event.
 
@@ -116,8 +85,11 @@ def _rotate_and_classify(
     2. Classify each new event into upcoming or past, skipping duplicates.
     Returns (new_upcoming, new_past).
     """
-    rotated_to_past = [e for e in upcoming if _is_past(e)]
-    still_upcoming = [e for e in upcoming if not _is_past(e)]
+    rotated_to_past = [e for e in upcoming if is_past(e)]
+    still_upcoming = [e for e in upcoming if not is_past(e)]
+
+    # Also drop anything beyond the prospective window (next 7 days)
+    still_upcoming = filter_prospective(still_upcoming)
 
     seen_upcoming = {_event_key(e) for e in still_upcoming}
     seen_past = {_event_key(e) for e in past + rotated_to_past}
@@ -126,12 +98,12 @@ def _rotate_and_classify(
     new_past: list[dict] = []
     for e in new_events:
         key = _event_key(e)
-        if _is_past(e):
+        if is_past(e):
             if key not in seen_past:
                 new_past.append(e)
                 seen_past.add(key)
         else:
-            if key not in seen_upcoming:
+            if key not in seen_upcoming and is_in_next_n_days(e):
                 new_upcoming.append(e)
                 seen_upcoming.add(key)
 
@@ -236,6 +208,15 @@ def main() -> None:
             upcoming_count=len(upcoming_events),
             past_count=len(past_events),
         )
+
+        # Trigger the event-driven miami-social radar TaskFlow on success
+        # upcoming_events.json now only contains prospective events (next ~7 days)
+        # so we can pass the full list directly
+        try:
+            trigger_radar(upcoming_events=upcoming_events)
+            log.info("Successfully triggered radar TaskFlow")
+        except Exception as radar_exc:
+            log.warning("Radar trigger failed (non-fatal): %s", radar_exc)
 
     except Exception as exc:
         log.error("Run failed: %s", exc, exc_info=True)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -416,3 +416,52 @@ def fetch_luma_calendar(slug_or_url: str) -> list[dict[str, Any]]:
         enriched.append(stub)
 
     return enriched
+
+
+def _parse_event_date(date_str: str | None) -> date | None:
+    """Parse the event's date field to a date object. Returns None if unparseable.
+    (Moved from fetch_events.py so filtering logic lives with the parsers.)"""
+    if not date_str:
+        return None
+    # ISO format (primary source from Luma/ICS)
+    try:
+        return date.fromisoformat(date_str)
+    except ValueError:
+        pass
+    # Natural-language fallbacks (body_text / html_scrape parse methods)
+    for fmt in ("%B %d, %Y", "%A, %B %d", "%A, %B %d, %Y"):
+        try:
+            parsed = datetime.strptime(date_str, fmt)
+            # For formats without a year, assume the next occurrence
+            if "%Y" not in fmt:
+                today = date.today()
+                parsed = parsed.replace(year=today.year)
+                if parsed.date() < today:
+                    parsed = parsed.replace(year=today.year + 1)
+            return parsed.date()
+        except ValueError:
+            continue
+    return None
+
+
+def is_past(event: dict) -> bool:
+    """Return True if the event date is strictly before today."""
+    event_date = _parse_event_date(event.get("date"))
+    if event_date is None:
+        return False  # Can't determine — keep it
+    return event_date < date.today()
+
+
+def is_in_next_n_days(event: dict, days: int = 7) -> bool:
+    """Return True if the event is today or within the next N days (prospective only)."""
+    event_date = _parse_event_date(event.get("date"))
+    if event_date is None:
+        return True  # unknown date — keep it for safety
+    today = date.today()
+    cutoff = today + timedelta(days=days)
+    return today <= event_date <= cutoff
+
+
+def filter_prospective(events: list[dict], days: int = 7) -> list[dict]:
+    """Filter to only events in the next N days."""
+    return [e for e in events if is_in_next_n_days(e, days)]
