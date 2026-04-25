@@ -160,7 +160,15 @@ def write_health(health: dict) -> None:
 
 
 def _fire_trigger(*, new_events: list[dict], health: dict) -> None:
-    """Wrap trigger_radar with the env-driven routing bits and error swallowing."""
+    """Wrap trigger_radar with env-driven routing and a last-resort safety net.
+
+    trigger_radar handles its own expected failure modes (missing config,
+    webhook errors, non-2xx responses) at appropriate log levels. The
+    try/except here only catches *unexpected* exceptions — programming bugs,
+    truly novel network errors, etc. — so the connector run isn't aborted by
+    a flaw in the trigger path. Those are logged at error level with a full
+    traceback so they're impossible to miss.
+    """
     try:
         trigger_radar(
             new_events=new_events,
@@ -170,8 +178,8 @@ def _fire_trigger(*, new_events: list[dict], health: dict) -> None:
             webhook_url=TASKFLOW_WEBHOOK_URL,
             webhook_secret=TASKFLOW_WEBHOOK_SECRET,
         )
-    except Exception as exc:
-        log.warning("Radar trigger failed (non-fatal): %s", exc)
+    except Exception:
+        log.error("Unexpected error in radar trigger (non-fatal)", exc_info=True)
 
 
 def main() -> None:

@@ -65,7 +65,7 @@ All configuration lives in `.env`. Copy `.env.example` and fill in:
 | `PROCESSED_IDS_PATH` | Tracks seen Message-IDs to prevent duplicates |
 | `TASKFLOW_USER_TARGET` | Slack user ID the agent should DM with its final message (i.e. you) |
 | `TASKFLOW_TRIGGER_PATH` | Where to write the JSON trigger artifact the agent reads |
-| `TASKFLOW_WEBHOOK_URL` | Gateway Webhooks plugin URL that creates the managed TaskFlow (usually `http://localhost:18790/plugins/webhooks/<route>`) |
+| `TASKFLOW_WEBHOOK_URL` | Gateway Webhooks plugin URL that creates the managed TaskFlow (usually `http://localhost:18789/plugins/webhooks/<route>`) |
 | `TASKFLOW_WEBHOOK_SECRET` | Shared secret matching the webhook route's configured secret on the Gateway |
 
 ## Running manually
