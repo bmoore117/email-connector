@@ -75,14 +75,14 @@ def trigger_radar(
         "targetUserId": user_target,
         "requirements": {
             "step1": (
-                "If hasErrors, synthesize a brief human-readable description "
-                "from health.last_error and DM the user."
+                "If hasErrors is true, synthesize a brief human-readable description "
+                "from health.last_error and DM the user. If no errors proceed to step2"
             ),
             "step2": (
-                "If healthy, read through newEvents yourself (no pre-filter), "
-                "cross-reference committed-events.md and pm-rhythm grind state, "
-                "flag the 1-2 best, include a headspace/balance suggestion, "
-                "and DM the user with an offer to commit."
+                "If healthy, read through newEvents, cross-reference committed-events.md from the miami-social skill, "
+                "the grind state from the pm-rhythm skill and any recent conversations with the user, "
+                "flag the 1-2 best events that are not already in the committed-events.md file, "
+                "and DM the user to highlight the opportunities."
             ),
         },
     }
