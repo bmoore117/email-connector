@@ -27,7 +27,32 @@ import subprocess
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+
+def _load_env_file(path: Path) -> None:
+    """Minimal .env loader so the smoke runs without python-dotenv installed.
+
+    Handles ``KEY=VALUE`` lines, optional surrounding quotes, ``#`` comments,
+    blank lines, and CRLF line endings. Does not handle multi-line values or
+    variable interpolation, which is fine for the connector's .env shape.
+    """
+    if not path.exists():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().rstrip("\r")
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 
 def _patch_subprocess_for_visibility() -> None:
@@ -60,7 +85,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    load_dotenv()
+    _load_env_file(Path(".env"))
 
     user_target = os.environ.get("TASKFLOW_USER_TARGET", "").strip()
     if not user_target:

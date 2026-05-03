@@ -137,16 +137,22 @@ def trigger_radar(
         )
         return
 
-    # On success, the JSON body has run/transport metadata that's worth
+    # On success, the JSON body has run/runner metadata that's worth
     # surfacing in the connector log — it lets us tell at a glance whether
-    # the turn went through the Gateway or fell back to embedded.
+    # the turn went through the Gateway or fell back to embedded, and how
+    # many tool calls the agent made.
     try:
         body = json.loads(result.stdout)
-        meta = body.get("meta") or {}
+        meta = (body.get("result") or {}).get("meta") or {}
+        runner = (meta.get("executionTrace") or {}).get("runner") or "?"
+        tool_summary = meta.get("toolSummary") or {}
         log.info(
-            "[radar-trigger] Agent turn complete (transport=%s, runId=%s)",
-            meta.get("transport", "?"),
-            body.get("runId") or meta.get("runId") or "?",
+            "[radar-trigger] Agent turn complete (runner=%s, runId=%s, tools=%d, failures=%d, durationMs=%s)",
+            runner,
+            body.get("runId") or "?",
+            tool_summary.get("calls", 0),
+            tool_summary.get("failures", 0),
+            meta.get("durationMs", "?"),
         )
     except ValueError:
         log.info(
