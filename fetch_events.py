@@ -31,6 +31,9 @@ TASKFLOW_USER_TARGET = os.environ.get("TASKFLOW_USER_TARGET", "")
 TASKFLOW_TRIGGER_PATH = Path(os.environ.get("TASKFLOW_TRIGGER_PATH", "miami-social-radar-trigger.json"))
 TASKFLOW_WEBHOOK_URL = os.environ.get("TASKFLOW_WEBHOOK_URL", "")
 TASKFLOW_WEBHOOK_SECRET = os.environ.get("TASKFLOW_WEBHOOK_SECRET", "")
+TASKFLOW_CHILD_SESSION_KEY = os.environ.get(
+    "TASKFLOW_CHILD_SESSION_KEY", "agent:main:subagent:miami-social-radar"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -177,6 +180,7 @@ def _fire_trigger(*, new_events: list[dict], health: dict) -> None:
             trigger_path=TASKFLOW_TRIGGER_PATH,
             webhook_url=TASKFLOW_WEBHOOK_URL,
             webhook_secret=TASKFLOW_WEBHOOK_SECRET,
+            child_session_key=TASKFLOW_CHILD_SESSION_KEY,
         )
     except Exception:
         log.error("Unexpected error in radar trigger (non-fatal)", exc_info=True)
