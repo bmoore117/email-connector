@@ -21,7 +21,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 RUN_DIR = SCRIPT_DIR / "run"
 RUN_DIR.mkdir(exist_ok=True)
 
-ARCHIVE_DIR = SCRIPT_DIR / "archive"
+ARCHIVE_DIR = RUN_DIR / "archive"
 ARCHIVE_DIR.mkdir(exist_ok=True)
 
 GMAIL_USER = os.environ["GMAIL_USER"]
