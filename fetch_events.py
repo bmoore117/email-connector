@@ -5,38 +5,38 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from dotenv import load_dotenv
 from imap_tools import MailBox
 
 from parse_events import parse_email, fetch_luma_calendar, is_past, is_in_next_n_days, filter_prospective
-from taskflow import trigger_radar
 
 load_dotenv()
+
+# Resolve all output paths relative to this script's directory under a "run/" folder.
+# This folder should be gitignored.
+SCRIPT_DIR = Path(__file__).parent.resolve()
+RUN_DIR = SCRIPT_DIR / "run"
+RUN_DIR.mkdir(exist_ok=True)
 
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 GMAIL_LABEL = os.environ.get("GMAIL_LABEL", "miami-social-event-source")
 LUMA_CALENDARS = [s.strip() for s in os.environ.get("LUMA_CALENDARS", "").split(",") if s.strip()]
-UPCOMING_EVENTS_PATH = Path(os.environ.get("UPCOMING_EVENTS_PATH", "upcoming_events.json"))
-PAST_EVENTS_PATH = Path(os.environ.get("PAST_EVENTS_PATH", "past_events.json"))
-HEALTH_OUTPUT_PATH = Path(os.environ.get("HEALTH_OUTPUT_PATH", "health.json"))
-LOG_PATH = Path(os.environ.get("LOG_PATH", "connector.log"))
-PROCESSED_IDS_PATH = Path(os.environ.get("PROCESSED_IDS_PATH", ".processed_ids"))
 
-# Agent routing — everything trigger_radar needs comes from here so
-# taskflow.py never touches disk for config.
-TASKFLOW_USER_TARGET = os.environ.get("TASKFLOW_USER_TARGET", "")
-TASKFLOW_TRIGGER_PATH = Path(os.environ.get("TASKFLOW_TRIGGER_PATH", "miami-social-radar-trigger.json"))
-TASKFLOW_AGENT_ID = os.environ.get("TASKFLOW_AGENT_ID", "main")
-TASKFLOW_TIMEOUT_SECONDS = int(os.environ.get("TASKFLOW_TIMEOUT_SECONDS", "600"))
+UPCOMING_EVENTS_PATH = RUN_DIR / "upcoming_events.json"
+PAST_EVENTS_PATH = RUN_DIR / "past_events.json"
+LOG_PATH = RUN_DIR / "connector.log"
+PROCESSED_IDS_PATH = RUN_DIR / ".processed_ids"
+DELTA_PATH = RUN_DIR / "upcoming-delta.json"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
-        logging.FileHandler(LOG_PATH),
+        TimedRotatingFileHandler(LOG_PATH, when="D", interval=1, backupCount=3),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -67,12 +67,7 @@ def _write_json_list(path: Path, events: list[dict]) -> None:
 
 
 def _event_key(event: dict) -> str:
-    """Canonical deduplication key for an event.
-
-    Uses the Luma event URL (query string stripped) when available, since that
-    is stable across runs and across email vs. calendar-crawl sources.  Falls
-    back to ``title|date`` for events that have no URL.
-    """
+    """Canonical deduplication key for an event."""
     url = (event.get("luma_url") or "").split("?")[0].rstrip("/").lower()
     if url:
         return url
@@ -90,14 +85,11 @@ def _rotate_and_classify(
     1. Move any existing upcoming events whose date has now passed into past.
     2. Classify each new event into upcoming or past, skipping duplicates.
 
-    Returns ``(new_upcoming, new_past, newly_added_upcoming)`` — the third
-    element is just the events added to the upcoming list this run, which is
-    what the TaskFlow cares about.
+    Returns ``(new_upcoming, new_past, newly_added_upcoming)``.
     """
     rotated_to_past = [e for e in upcoming if is_past(e)]
     still_upcoming = [e for e in upcoming if not is_past(e)]
 
-    # Also drop anything beyond the prospective window (next 7 days)
     still_upcoming = filter_prospective(still_upcoming)
 
     seen_upcoming = {_event_key(e) for e in still_upcoming}
@@ -123,63 +115,33 @@ def _rotate_and_classify(
     )
 
 
-def build_health(*, last_error: str | None, emails_processed: int, upcoming_count: int, past_count: int) -> dict:
-    """Build the health dict for this run, rolling in prior state from disk."""
-    now = datetime.now(timezone.utc).isoformat()
+def _load_previous_consecutive_failures() -> int:
+    """Read the last known consecutive_failures from the previous delta artifact, if any."""
+    if not DELTA_PATH.exists():
+        return 0
+    try:
+        data = json.loads(DELTA_PATH.read_text())
+        return int(data.get("health", {}).get("consecutive_failures", 0))
+    except Exception:
+        return 0
 
-    existing: dict = {}
-    if HEALTH_OUTPUT_PATH.exists():
-        try:
-            existing = json.loads(HEALTH_OUTPUT_PATH.read_text())
-        except Exception:
-            pass
 
-    if last_error:
-        consecutive_failures = existing.get("consecutive_failures", 0) + 1
-        last_success = existing.get("last_success")
-        last_error_time = now
-    else:
-        consecutive_failures = 0
-        last_success = now
-        last_error_time = existing.get("last_error_time")
+def write_delta_artifact(*, new_events: list[dict], health: dict) -> None:
+    """Write a minimal delta artifact for the Hermes watcher."""
+    has_errors = bool(health.get("consecutive_failures", 0)) or bool(health.get("last_error"))
 
-    return {
-        "last_run": now,
-        "last_success": last_success,
-        "consecutive_failures": consecutive_failures,
-        "last_error": last_error,
-        "last_error_time": last_error_time,
-        "emails_processed_last_run": emails_processed,
-        "upcoming_events": upcoming_count,
-        "past_events": past_count,
+    delta_data = {
+        "triggered_at": datetime.now(timezone.utc).isoformat(),
+        "newEvents": new_events,
+        "health": health,
+        "hasErrors": has_errors,
     }
 
-
-def write_health(health: dict) -> None:
-    HEALTH_OUTPUT_PATH.write_text(json.dumps(health, indent=2))
-
-
-def _fire_trigger(*, new_events: list[dict], health: dict) -> None:
-    """Wrap trigger_radar with env-driven routing and a last-resort safety net.
-
-    trigger_radar handles its own expected failure modes (missing config,
-    webhook errors, non-2xx responses) at appropriate log levels. The
-    try/except here only catches *unexpected* exceptions — programming bugs,
-    truly novel network errors, etc. — so the connector run isn't aborted by
-    a flaw in the trigger path. Those are logged at error level with a full
-    traceback so they're impossible to miss.
-    """
-    try:
-        trigger_radar(
-            new_events=new_events,
-            health=health,
-            user_target=TASKFLOW_USER_TARGET,
-            trigger_path=TASKFLOW_TRIGGER_PATH,
-            agent_id=TASKFLOW_AGENT_ID,
-            timeout_seconds=TASKFLOW_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        log.error("Unexpected error in radar trigger (non-fatal)", exc_info=True)
+    DELTA_PATH.write_text(json.dumps(delta_data, indent=2, default=str))
+    log.info(
+        "Delta artifact written: %d new event(s), hasErrors=%s",
+        len(new_events), has_errors
+    )
 
 
 def main() -> None:
@@ -217,8 +179,6 @@ def main() -> None:
                 processed_ids.add(msg_id)
                 emails_processed += 1
 
-        # Fetch directly from key Luma calendars to broaden scope beyond Gmail emails only.
-        # Uses existing parsing logic from parse_events.py.
         for slug in LUMA_CALENDARS:
             log.info("Fetching from Luma calendar: %s", slug)
             events = fetch_luma_calendar(slug)
@@ -242,35 +202,37 @@ def main() -> None:
             len(upcoming_events),
             len(past_events),
         )
-        health = build_health(
-            last_error=None,
-            emails_processed=emails_processed,
-            upcoming_count=len(upcoming_events),
-            past_count=len(past_events),
-        )
-        write_health(health)
 
-        # Only wake the agent when there is something new to surface or an
-        # unresolved error to explain. Otherwise successful-but-empty runs
-        # would DM the user every 30 minutes.
-        has_errors = bool(health.get("consecutive_failures", 0)) or bool(health.get("last_error"))
-        if newly_added or has_errors:
-            log.info("Triggering radar TaskFlow (%d new event(s), errors=%s)", len(newly_added), has_errors)
-            _fire_trigger(new_events=newly_added, health=health)
+        # Success path always resets consecutive_failures to 0
+        health = {
+            "last_run": datetime.now(timezone.utc).isoformat(),
+            "emails_processed_last_run": emails_processed,
+            "upcoming_events": len(upcoming_events),
+            "past_events": len(past_events),
+            "consecutive_failures": 0,
+            "last_error": None,
+            "last_error_time": None,
+        }
+
+        if newly_added:
+            write_delta_artifact(new_events=newly_added, health=health)
         else:
-            log.info("No new events and no errors — skipping TaskFlow trigger")
+            log.info("No new events — no delta artifact written")
 
     except Exception as exc:
         log.error("Run failed: %s", exc, exc_info=True)
-        health = build_health(
-            last_error=str(exc),
-            emails_processed=emails_processed,
-            upcoming_count=len(upcoming_events),
-            past_count=len(past_events),
-        )
-        write_health(health)
-        # Still fire a trigger on error so the agent can DM about the failure.
-        _fire_trigger(new_events=[], health=health)
+
+        prev_failures = _load_previous_consecutive_failures()
+        error_health = {
+            "last_run": datetime.now(timezone.utc).isoformat(),
+            "emails_processed_last_run": emails_processed,
+            "upcoming_events": len(upcoming_events),
+            "past_events": len(past_events),
+            "consecutive_failures": prev_failures + 1,
+            "last_error": str(exc),
+            "last_error_time": datetime.now(timezone.utc).isoformat(),
+        }
+        write_delta_artifact(new_events=[], health=error_health)
         sys.exit(1)
 
 
