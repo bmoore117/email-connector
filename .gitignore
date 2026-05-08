@@ -1,9 +1,5 @@
 .env
-.processed_ids
-.venv/
+run/
 __pycache__/
-connector.log
-health.json
-past_events.json
-upcoming_events.json
-miami-social-radar-trigger.json
+.venv/
+venv/

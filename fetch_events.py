@@ -21,6 +21,9 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 RUN_DIR = SCRIPT_DIR / "run"
 RUN_DIR.mkdir(exist_ok=True)
 
+ARCHIVE_DIR = SCRIPT_DIR / "archive"
+ARCHIVE_DIR.mkdir(exist_ok=True)
+
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 GMAIL_LABEL = os.environ.get("GMAIL_LABEL", "miami-social-event-source")
@@ -31,6 +34,7 @@ PAST_EVENTS_PATH = RUN_DIR / "past_events.json"
 LOG_PATH = RUN_DIR / "connector.log"
 PROCESSED_IDS_PATH = RUN_DIR / ".processed_ids"
 DELTA_PATH = RUN_DIR / "upcoming-delta.json"
+ARCHIVED_DELTA_PATH = ARCHIVE_DIR / "upcoming-delta.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -116,11 +120,11 @@ def _rotate_and_classify(
 
 
 def _load_previous_consecutive_failures() -> int:
-    """Read the last known consecutive_failures from the previous delta artifact, if any."""
-    if not DELTA_PATH.exists():
+    """Read the last known consecutive_failures from the archived delta, if any."""
+    if not ARCHIVED_DELTA_PATH.exists():
         return 0
     try:
-        data = json.loads(DELTA_PATH.read_text())
+        data = json.loads(ARCHIVED_DELTA_PATH.read_text())
         return int(data.get("health", {}).get("consecutive_failures", 0))
     except Exception:
         return 0
