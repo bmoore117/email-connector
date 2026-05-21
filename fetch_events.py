@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import argparse
+import hashlib
+import hmac
 import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 from imap_tools import MailBox
 
@@ -21,20 +25,15 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 RUN_DIR = SCRIPT_DIR / "run"
 RUN_DIR.mkdir(exist_ok=True)
 
-ARCHIVE_DIR = RUN_DIR / "archive"
-ARCHIVE_DIR.mkdir(exist_ok=True)
-
-GMAIL_USER = os.environ["GMAIL_USER"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-GMAIL_LABEL = os.environ.get("GMAIL_LABEL", "miami-social-event-source")
-LUMA_CALENDARS = [s.strip() for s in os.environ.get("LUMA_CALENDARS", "").split(",") if s.strip()]
+DEFAULT_HERMES_WEBHOOK_URL = "http://127.0.0.1:8644/webhooks/luma-events"
+DEFAULT_HERMES_WEBHOOK_SECRET = "INSECURE_NO_AUTH"
 
 UPCOMING_EVENTS_PATH = RUN_DIR / "upcoming_events.json"
 PAST_EVENTS_PATH = RUN_DIR / "past_events.json"
 LOG_PATH = RUN_DIR / "connector.log"
 PROCESSED_IDS_PATH = RUN_DIR / ".processed_ids"
-DELTA_PATH = RUN_DIR / "upcoming-delta.json"
-ARCHIVED_DELTA_PATH = ARCHIVE_DIR / "upcoming-delta.json"
+CONNECTOR_STATE_PATH = RUN_DIR / ".connector-state.json"
+DEFAULT_AGENT_PROMPT_PATH = SCRIPT_DIR / "hermes" / "agent-prompt.txt"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +44,35 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+
+def _resolve_hermes_webhook_config() -> tuple[str, str, bool, bool]:
+    enabled = os.environ.get("HERMES_WEBHOOK_ENABLED", "true").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    url = os.environ.get("HERMES_WEBHOOK_URL", "").strip()
+    secret = os.environ.get("HERMES_WEBHOOK_SECRET", "").strip()
+
+    if enabled:
+        if not url:
+            url = DEFAULT_HERMES_WEBHOOK_URL
+            log.info("HERMES_WEBHOOK_URL unset — using default %s", url)
+        if not secret:
+            secret = DEFAULT_HERMES_WEBHOOK_SECRET
+            log.info(
+                "HERMES_WEBHOOK_SECRET unset — using default %s (loopback gateway only)",
+                secret,
+            )
+
+    no_auth = not secret or secret == "INSECURE_NO_AUTH"
+    return url, secret, enabled, no_auth
+
+
+HERMES_WEBHOOK_URL, HERMES_WEBHOOK_SECRET, HERMES_WEBHOOK_ENABLED, HERMES_NO_AUTH = (
+    _resolve_hermes_webhook_config()
+)
 
 
 def load_processed_ids() -> set[str]:
@@ -120,36 +148,185 @@ def _rotate_and_classify(
 
 
 def _load_previous_consecutive_failures() -> int:
-    """Read the last known consecutive_failures from the archived delta, if any."""
-    if not ARCHIVED_DELTA_PATH.exists():
+    if not CONNECTOR_STATE_PATH.exists():
         return 0
     try:
-        data = json.loads(ARCHIVED_DELTA_PATH.read_text())
-        return int(data.get("health", {}).get("consecutive_failures", 0))
+        return int(json.loads(CONNECTOR_STATE_PATH.read_text()).get("consecutive_failures", 0))
     except Exception:
         return 0
 
 
-def write_delta_artifact(*, new_events: list[dict], health: dict) -> None:
-    """Write a minimal delta artifact for the Hermes watcher."""
-    has_errors = bool(health.get("consecutive_failures", 0)) or bool(health.get("last_error"))
+def _save_connector_state(*, consecutive_failures: int) -> None:
+    CONNECTOR_STATE_PATH.write_text(
+        json.dumps({"consecutive_failures": consecutive_failures}, indent=2)
+    )
 
-    delta_data = {
+
+def _load_agent_prompt() -> str:
+    path = Path(os.environ.get("HERMES_AGENT_PROMPT_PATH", DEFAULT_AGENT_PROMPT_PATH)).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Agent prompt not found: {path}")
+    return path.read_text().strip()
+
+
+def build_run_data(*, new_events: list[dict], health: dict) -> dict:
+    has_errors = bool(health.get("consecutive_failures", 0)) or bool(health.get("last_error"))
+    return {
         "triggered_at": datetime.now(timezone.utc).isoformat(),
         "newEvents": new_events,
         "health": health,
         "hasErrors": has_errors,
     }
 
-    DELTA_PATH.write_text(json.dumps(delta_data, indent=2, default=str))
-    log.info(
-        "Delta artifact written: %d new event(s), hasErrors=%s",
-        len(new_events), has_errors
+
+def build_hermes_webhook_payload(
+    *, new_events: list[dict], health: dict
+) -> tuple[dict, dict]:
+    """Webhook body: instructions + structured run fields for the Hermes route template."""
+    run_data = build_run_data(new_events=new_events, health=health)
+    body = {
+        "instructions": _load_agent_prompt(),
+        "triggered_at": run_data["triggered_at"],
+        "hasErrors": run_data["hasErrors"],
+        "newEvents": run_data["newEvents"],
+        "health": run_data["health"],
+    }
+    return body, run_data
+
+
+def _hermes_webhook_signature(body: bytes, secret: str) -> str:
+    return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def _post_hermes_payload(payload: dict) -> bool:
+    if not HERMES_WEBHOOK_ENABLED:
+        log.error("Hermes webhook disabled (HERMES_WEBHOOK_ENABLED)")
+        return False
+    if not HERMES_WEBHOOK_URL:
+        log.error("Hermes webhook not configured (set HERMES_WEBHOOK_URL)")
+        return False
+
+    body = json.dumps(payload, default=str, separators=(",", ":")).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Request-ID": payload["triggered_at"],
+    }
+    if not HERMES_NO_AUTH:
+        headers["X-Webhook-Signature"] = _hermes_webhook_signature(body, HERMES_WEBHOOK_SECRET)
+    try:
+        resp = requests.post(
+            HERMES_WEBHOOK_URL,
+            data=body,
+            headers=headers,
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        log.error("Hermes webhook request failed: %s", exc)
+        return False
+
+    if resp.ok:
+        log.info("Hermes webhook accepted (%s)", resp.status_code)
+        return True
+
+    log.error(
+        "Hermes webhook rejected (%s): %s",
+        resp.status_code,
+        (resp.text or "")[:500],
     )
+    return False
+
+
+def notify_hermes(*, new_events: list[dict], health: dict) -> bool:
+    """POST instructions and run data to the local Hermes webhook route."""
+    try:
+        payload, run_data = build_hermes_webhook_payload(new_events=new_events, health=health)
+    except FileNotFoundError as exc:
+        log.error("%s", exc)
+        return False
+
+    ok = _post_hermes_payload(payload)
+    if ok:
+        log.info(
+            "Notified Hermes: %d new event(s), hasErrors=%s",
+            len(new_events),
+            run_data["hasErrors"],
+        )
+    return ok
+
+
+def _sample_test_events() -> list[dict]:
+    event_date = (date.today() + timedelta(days=3)).isoformat()
+    return [
+        {
+            "title": "[TEST] Miami Social Radar — webhook check",
+            "date": event_date,
+            "time": "19:00",
+            "location": "Test venue (synthetic — safe to ignore)",
+            "description": "Synthetic event from `fetch_events.py test`.",
+            "luma_url": "https://lu.ma/test-webhook-check",
+            "parse_method": "test",
+            "source": "fetch_events.py test",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+    ]
+
+
+def _sample_test_health(*, simulate_error: bool) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    if simulate_error:
+        return {
+            "last_run": now,
+            "emails_processed_last_run": 0,
+            "upcoming_events": 0,
+            "past_events": 0,
+            "consecutive_failures": 1,
+            "last_error": "Synthetic error from fetch_events.py test --error",
+            "last_error_time": now,
+        }
+    return {
+        "last_run": now,
+        "emails_processed_last_run": 0,
+        "upcoming_events": 1,
+        "past_events": 0,
+        "consecutive_failures": 0,
+        "last_error": None,
+        "last_error_time": None,
+    }
+
+
+def run_hermes_test(*, simulate_error: bool = False, dry_run: bool = False) -> None:
+    """POST a synthetic payload to verify the Hermes webhook route (no Gmail/Luma)."""
+    log.info("--- Hermes webhook test (error=%s, dry_run=%s) ---", simulate_error, dry_run)
+    log.info("Target: %s", HERMES_WEBHOOK_URL or "(not configured)")
+
+    new_events = [] if simulate_error else _sample_test_events()
+    health = _sample_test_health(simulate_error=simulate_error)
+
+    try:
+        payload, run_data = build_hermes_webhook_payload(new_events=new_events, health=health)
+    except FileNotFoundError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
+
+    if dry_run:
+        print(json.dumps(payload, indent=2, default=str))
+        log.info("Dry run — payload printed, not sent (hasErrors=%s)", run_data["hasErrors"])
+        return
+
+    if _post_hermes_payload(payload):
+        log.info("Test webhook succeeded (hasErrors=%s)", run_data["hasErrors"])
+        return
+
+    sys.exit(1)
 
 
 def main() -> None:
     log.info("--- email-connector run started ---")
+
+    gmail_user = os.environ["GMAIL_USER"]
+    gmail_password = os.environ["GMAIL_APP_PASSWORD"]
+    gmail_label = os.environ.get("GMAIL_LABEL", "miami-social-event-source")
+    luma_calendars = [s.strip() for s in os.environ.get("LUMA_CALENDARS", "").split(",") if s.strip()]
 
     processed_ids = load_processed_ids()
     upcoming_events = _load_json_list(UPCOMING_EVENTS_PATH)
@@ -158,9 +335,9 @@ def main() -> None:
     emails_processed = 0
 
     try:
-        with MailBox("imap.gmail.com").login(GMAIL_USER, GMAIL_APP_PASSWORD) as mailbox:
-            mailbox.folder.set(GMAIL_LABEL)
-            log.info("Connected to Gmail, reading label '%s'", GMAIL_LABEL)
+        with MailBox("imap.gmail.com").login(gmail_user, gmail_password) as mailbox:
+            mailbox.folder.set(gmail_label)
+            log.info("Connected to Gmail, reading label '%s'", gmail_label)
 
             for msg in mailbox.fetch():
                 msg_id = (msg.headers.get("message-id") or [None])[0]
@@ -183,7 +360,7 @@ def main() -> None:
                 processed_ids.add(msg_id)
                 emails_processed += 1
 
-        for slug in LUMA_CALENDARS:
+        for slug in luma_calendars:
             log.info("Fetching from Luma calendar: %s", slug)
             events = fetch_luma_calendar(slug)
             if events:
@@ -218,10 +395,12 @@ def main() -> None:
             "last_error_time": None,
         }
 
+        _save_connector_state(consecutive_failures=0)
+
         if newly_added:
-            write_delta_artifact(new_events=newly_added, health=health)
+            notify_hermes(new_events=newly_added, health=health)
         else:
-            log.info("No new events — no delta artifact written")
+            log.info("No new events — Hermes webhook not sent")
 
     except Exception as exc:
         log.error("Run failed: %s", exc, exc_info=True)
@@ -236,9 +415,37 @@ def main() -> None:
             "last_error": str(exc),
             "last_error_time": datetime.now(timezone.utc).isoformat(),
         }
-        write_delta_artifact(new_events=[], health=error_health)
+        _save_connector_state(consecutive_failures=error_health["consecutive_failures"])
+        notify_hermes(new_events=[], health=error_health)
         sys.exit(1)
 
 
+def _parse_test_cli() -> argparse.Namespace | None:
+    if len(sys.argv) <= 1:
+        return None
+    if sys.argv[1] != "test":
+        log.error("Unknown command %r — use: fetch_events.py test", sys.argv[1])
+        sys.exit(2)
+
+    parser = argparse.ArgumentParser(
+        description="POST a synthetic Hermes webhook payload (no Gmail/Luma). Exits 1 on failure.",
+    )
+    parser.add_argument(
+        "--error",
+        action="store_true",
+        help="Simulate a failed scraper run (hasErrors=true, empty newEvents).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the JSON payload to stdout without POSTing.",
+    )
+    return parser.parse_args(sys.argv[2:])
+
+
 if __name__ == "__main__":
-    main()
+    test_args = _parse_test_cli()
+    if test_args is None:
+        main()
+    else:
+        run_hermes_test(simulate_error=test_args.error, dry_run=test_args.dry_run)

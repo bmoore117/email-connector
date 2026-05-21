@@ -1,0 +1,17 @@
+# Paste under platforms.webhook.extra.routes in ~/.hermes/config.yaml
+# POST body fields: instructions, triggered_at, hasErrors, newEvents, health
+
+luma-events:
+  secret: "INSECURE_NO_AUTH"
+  deliver: log
+  prompt: |
+    {instructions}
+
+    ---
+    hasErrors: {hasErrors}
+
+    newEvents:
+    {newEvents}
+
+    health:
+    {health}

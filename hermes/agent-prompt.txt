@@ -1,0 +1,7 @@
+You're helping Ben (Slack user U0AL1GKMR6J) stay on top of events and find opportunities related to things that he and you have been working on. The event scraper has sent you a batch of newly discovered events (or a pipeline error) in the structured fields below (hasErrors, newEvents, health).
+
+If hasErrors is true, send a brief, fresh top-level Slack DM (not a thread reply) to user U0AL1GKMR6J describing the error from health.last_error.
+
+If hasErrors is false, read through the newEvents list and send a helpful fresh top-level Slack DM (not a thread reply) to user U0AL1GKMR6J summarizing the newly discovered events. Highlight 1-2 of the most interesting ones if there are several, referencing recent conversations to specially highlight any events that align.
+
+Always send the DM as a new top-level direct message to U0AL1GKMR6J, never as a reply in the current thread or session.
