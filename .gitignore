@@ -1,3 +1,5 @@
+*.iml
+.idea/
 .env
 run/
 __pycache__/
