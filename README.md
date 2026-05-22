@@ -159,9 +159,10 @@ the agent needs as separate JSON fields: `instructions` (from `hermes/agent-prom
 2. If there are newly discovered events *or* the run errored, the connector POSTs to
    `HERMES_WEBHOOK_URL` (defaults to `http://127.0.0.1:8644/webhooks/luma-events`).
 3. Hermes renders a short route template that references those fields (see
-   `hermes/config-route.example.yaml`), then runs the agent. The agent sends a fresh
-   top-level Slack DM to `U0AL1GKMR6J` per the instructions.
-4. Use `deliver: log` on the route so Hermes does not also post a duplicate summary.
+   `hermes/config-route.example.yaml`), then runs the agent.
+4. Hermes delivers the agent's final reply to Slack (`deliver: slack`,
+   `deliver_extra.chat_id` set to Ben's Slack DM channel id, e.g. `D0AM220AB6U`). Do not
+   use `deliver: log` if you want a DM.
 
 Runs that find nothing new and have a clean health status are silent — no webhook.
 
@@ -175,35 +176,39 @@ with `HERMES_AGENT_PROMPT_PATH` in `.env` if needed.
 
 ### Gateway setup (one-time)
 
-On the same machine as this script:
+On the same machine as this script. `hermes gateway setup` only configures messaging
+platforms (Slack, etc.) — webhooks are enabled separately via `~/.hermes/.env` or
+`config.yaml` below.
+
+**1. Enable the webhook adapter** — add to `~/.hermes/.env`:
 
 ```bash
-hermes gateway setup   # enable webhooks, port 8644
+WEBHOOK_ENABLED=true
+WEBHOOK_PORT=8644
 ```
 
-Merge [`hermes/config-route.example.yaml`](hermes/config-route.example.yaml) under
-`platforms.webhook.extra.routes` in `~/.hermes/config.yaml`:
+**2. Add the route** — merge [`hermes/config-route.example.yaml`](hermes/config-route.example.yaml)
+under `platforms.webhook.extra.routes` in `~/.hermes/config.yaml` (full shape):
 
-```yaml
-luma-events:
-  secret: "INSECURE_NO_AUTH"
-  deliver: log
-  prompt: |
-    {instructions}
-    ---
-    hasErrors: {hasErrors}
-    newEvents:
-    {newEvents}
-    health:
-    {health}
+Copy [`hermes/config-route.example.yaml`](hermes/config-route.example.yaml) into your
+`platforms` section (or merge the `webhook` block). **Set `host: "127.0.0.1"`** — the
+adapter defaults to `0.0.0.0`, and Hermes refuses `INSECURE_NO_AUTH` on non-loopback
+binds.
+
+**Alternative:** `hermes webhook subscribe luma-events` (after webhooks are enabled) —
+paste the `prompt` block from the example file. Subscriptions go to
+`~/.hermes/webhook_subscriptions.json` and hot-reload without a restart.
+
+**3. Restart the gateway** so it picks up env/config changes:
+
+```bash
+hermes gateway run
+# or restart your systemd user service, if installed
 ```
 
-Or subscribe via CLI (paste the `prompt` block from `hermes/config-route.example.yaml`).
-
-For local deployment, leave `HERMES_WEBHOOK_SECRET` unset in `.env` (defaults to
-`INSECURE_NO_AUTH`). Use a real shared secret if the gateway is reachable beyond localhost.
-
-Start the gateway: `hermes gateway run`.
+For local deployment, leave `HERMES_WEBHOOK_SECRET` unset in the luma-events `.env`
+(defaults to `INSECURE_NO_AUTH`). Use a real shared secret if the gateway is reachable
+beyond localhost.
 
 Verify:
 
@@ -211,6 +216,19 @@ Verify:
 curl http://127.0.0.1:8644/health
 hermes webhook test luma-events --payload '{"instructions":"Test: reply OK","triggered_at":"test-1","hasErrors":false,"newEvents":[],"health":{}}'
 ```
+
+**Troubleshooting**
+
+- `INSECURE_NO_AUTH` refused on `0.0.0.0`: add `host: "127.0.0.1"` under
+  `platforms.webhook.extra` and restart the gateway.
+- Webhook returns 202 but no Slack message: use `deliver: slack` (not `log`). Set
+  `deliver_extra.chat_id` to Ben's **DM channel id** (`D…`), not his user id (`U…`) —
+  Hermes `send_message` cannot resolve `U0AL1GKMR6J`. A successful test used
+  `D0AM220AB6U` (confirm on your workspace). Slack must be connected in the gateway.
+- Agent logs show `send_message` errors then "DM sent successfully" but nothing visible:
+  check the DM thread with your Hermes bot; the webhook `deliver: log` path only logs
+  the final 265-char summary unless `deliver: slack` is set.
+- Inspect the agent run: `grep -i luma-events ~/.hermes/logs/gateway.log` (path may vary).
 
 ### Testing without Gmail
 

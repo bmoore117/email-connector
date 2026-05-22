@@ -1,17 +1,27 @@
-# Paste under platforms.webhook.extra.routes in ~/.hermes/config.yaml
+# Merge into ~/.hermes/config.yaml (under platforms.webhook).
+# INSECURE_NO_AUTH only works when the webhook binds to loopback — not 0.0.0.0.
 # POST body fields: instructions, triggered_at, hasErrors, newEvents, health
 
-luma-events:
-  secret: "INSECURE_NO_AUTH"
-  deliver: log
-  prompt: |
-    {instructions}
+platforms:
+  webhook:
+    extra:
+      host: "127.0.0.1"
+      routes:
+        luma-events:
+          secret: "INSECURE_NO_AUTH"
+          deliver: slack
+          deliver_extra:
+            # Slack DM channel id (D…), not user id (U…). From a successful test run: D0AM220AB6U.
+            # Verify: ask Hermes to run send_message(action='list') or check Slack DM channel details.
+            chat_id: "D0AM220AB6U"
+          prompt: |
+            {instructions}
 
-    ---
-    hasErrors: {hasErrors}
+            ---
+            hasErrors: {hasErrors}
 
-    newEvents:
-    {newEvents}
+            newEvents:
+            {newEvents}
 
-    health:
-    {health}
+            health:
+            {health}
